@@ -1,0 +1,351 @@
+# AI Customer Support Agent with Tools
+# Kaggle-ready Notebook
+
+"""
+Project: AI Customer Support Agent with Tools
+Description: A self-contained Kaggle notebook that demonstrates an AI agent which can:
+ - Answer FAQs using an embeddings-based retriever (or TF-IDF fallback)
+ - Lookup product info from a SQL database via a function
+ - Perform calculations via a calculator function
+ - Use function-calling style interaction so the model decides which tool to call
+
+This notebook is structured for clarity and to be directly usable on Kaggle. Replace the LLM-wrapper sections with your chosen LLM (Gemini/OpenAI) and API keys.
+
+Sections:
+1) Setup & Dependencies
+2) Sample Data (SQL products, FAQ corpus)
+3) Tools: search_db, calculator, faq_retriever
+4) LLM wrapper & function-calling loop (agent)
+5) Demo conversations & tests
+6) Evaluation and extensions
+
+Notes:
+- The notebook contains both an API-based embeddings approach (recommended) and a local TF-IDF fallback so it runs without external services.
+- For function calling, we simulate the LLM choosing a function in a schema-driven way; example code demonstrates parsing a JSON response from the LLM.
+"""
+
+# ---------------------------
+# 1) Setup & Dependencies
+# ---------------------------
+
+# Install required packages (in Kaggle you may need to run these once)
+# Uncomment and run if packages are missing
+# !pip install openai tiktoken faiss-cpu sentence-transformers scikit-learn
+
+# Imports
+import sqlite3
+import json
+import traceback
+from typing import Dict, Any, List, Tuple, Optional
+import pandas as pd
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import math
+
+# Optional: imports for embeddings if using sentence-transformers locally
+try:
+    from sentence_transformers import SentenceTransformer
+    EMB_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+except Exception:
+    EMB_MODEL = None
+
+# ---------------------------
+# 2) Sample Data
+# ---------------------------
+
+# Create a sample SQLite database of products (in-memory for demo; save to file for persistence)
+conn = sqlite3.connect(':memory:')
+cur = conn.cursor()
+cur.execute('''
+CREATE TABLE products (
+    id INTEGER PRIMARY KEY,
+    name TEXT,
+    sku TEXT,
+    price REAL,
+    stock INTEGER,
+    description TEXT
+)
+''')
+
+products = [
+    (1, 'Acme Phone X', 'APX-100', 699.00, 12, 'A flagship phone with 6.5" display, 128GB storage, 12MP camera.'),
+    (2, 'Acme Phone Mini', 'APM-50', 399.00, 30, 'Compact phone with 5.5" display and all-day battery.'),
+    (3, 'Acme Charger', 'AC-01', 29.99, 150, 'Fast charger with USB-C, 20W output.'),
+    (4, 'Acme Headphones', 'AH-20', 129.99, 45, 'Wireless over-ear headphones, noise-cancelling.')
+]
+cur.executemany('INSERT INTO products VALUES (?, ?, ?, ?, ?, ?)', products)
+conn.commit()
+
+# Create an FAQ corpus (as a list of docs)
+faq_docs = [
+    {"id": "faq_1", "title": "Warranty Policy", "text": "All Acme products come with a 1-year limited warranty covering manufacturing defects. Accidental damage is not covered."},
+    {"id": "faq_2", "title": "Return Policy", "text": "You can return most products within 30 days of purchase with a receipt. Open-box accessories may have a restocking fee."},
+    {"id": "faq_3", "title": "Shipping Times", "text": "Standard shipping is 5-7 business days; express shipping is 1-2 business days."},
+    {"id": "faq_4", "title": "Battery Care", "text": "Avoid exposing batteries to extreme temperatures. For best practice, charge regularly and avoid leaving at 0% for long periods."}
+]
+
+faq_df = pd.DataFrame(faq_docs)
+
+# ---------------------------
+# 3) Tools
+# ---------------------------
+
+# 3A) search_db: simple SQL lookup function
+def search_db(product_name: str) -> Dict[str, Any]:
+    """Search the products DB by name or SKU and return structured info.
+    Returns JSON-like dict for the agent to consume.
+    """
+    cur = conn.cursor()
+    # naive search using LIKE; you can enhance with full-text search
+    q = "SELECT id, name, sku, price, stock, description FROM products WHERE name LIKE ? OR sku LIKE ?"
+    param = f"%{product_name}%"
+    cur.execute(q, (param, param))
+    rows = cur.fetchall()
+    results = []
+    for r in rows:
+        results.append({
+            "id": r[0],
+            "name": r[1],
+            "sku": r[2],
+            "price": float(r[3]),
+            "stock": int(r[4]),
+            "description": r[5]
+        })
+    return {"tool": "search_db", "query": product_name, "results": results}
+
+# 3B) calculator tool
+def calculator(expression: str) -> Dict[str, Any]:
+    """Evaluate safe mathematical expressions. Disallow __builtins__ and names.
+    This is intentionally simple — extend with parsers for production.
+    """
+    try:
+        # safe eval using math namespace
+        allowed_names = {k: getattr(math, k) for k in dir(math) if not k.startswith("__")}
+        # add commonly used constants
+        allowed_names.update({'abs': abs, 'round': round, 'min': min, 'max': max})
+        result = eval(expression, {"__builtins__": {}}, allowed_names)
+        return {"tool": "calculator", "expression": expression, "result": result}
+    except Exception as e:
+        return {"tool": "calculator", "expression": expression, "error": str(e)}
+
+# 3C) FAQ retriever: embeddings-based or TF-IDF fallback
+class FAQRetriever:
+    def __init__(self, docs: List[Dict[str, Any]]):
+        self.docs = docs
+        self.texts = [d['text'] for d in docs]
+        self.ids = [d['id'] for d in docs]
+        # Try to build sentence-transformers embeddings if available
+        if EMB_MODEL is not None:
+            self.embeddings = EMB_MODEL.encode(self.texts, convert_to_numpy=True)
+            self.mode = 'sentence-transformer'
+        else:
+            # TF-IDF fallback
+            self.vectorizer = TfidfVectorizer().fit(self.texts)
+            self.tfidf = self.vectorizer.transform(self.texts)
+            self.mode = 'tfidf'
+
+    def retrieve(self, query: str, top_k: int = 2) -> List[Dict[str, Any]]:
+        if self.mode == 'sentence-transformer':
+            q_emb = EMB_MODEL.encode([query], convert_to_numpy=True)[0]
+            sims = cosine_similarity([q_emb], self.embeddings)[0]
+            idx = np.argsort(-sims)[:top_k]
+            return [{'id': self.ids[i], 'text': self.texts[i], 'score': float(sims[i])} for i in idx]
+        else:
+            q_tfidf = self.vectorizer.transform([query])
+            sims = cosine_similarity(q_tfidf, self.tfidf)[0]
+            idx = np.argsort(-sims)[:top_k]
+            return [{'id': self.ids[i], 'text': self.texts[i], 'score': float(sims[i])} for i in idx]
+
+faq_retriever = FAQRetriever(faq_docs)
+
+# ---------------------------
+# 4) LLM wrapper & Agent
+# ---------------------------
+
+# NOTE: You should replace the `call_llm` function with your platform's API (Gemini/OpenAI).
+# This notebook includes a placeholder simulator to show how function calling works.
+
+# 4A) Function schemas that the LLM can call. When using real APIs, pass these to the model.
+FUNCTION_SCHEMAS = [
+    {
+        'name': 'search_db',
+        'description': 'Search product catalog by product name or SKU and return product details',
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'product_name': {'type': 'string', 'description': 'Name or SKU to search for'}
+            },
+            'required': ['product_name']
+        }
+    },
+    {
+        'name': 'calculator',
+        'description': 'Evaluate a mathematical expression and return the result',
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'expression': {'type': 'string', 'description': 'Mathematical expression to evaluate'}
+            },
+            'required': ['expression']
+        }
+    },
+    {
+        'name': 'faq_retriever',
+        'description': 'Retrieve relevant FAQ documents to answer customer questions',
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'query': {'type': 'string', 'description': 'User question to search FAQ for'},
+                'top_k': {'type': 'integer', 'description': 'Number of top docs to return'}
+            },
+            'required': ['query']
+        }
+    }
+]
+
+# 4B) A simple LLM call simulator (replace with actual API call)
+
+def simulate_llm_response(user_message: str, system_prompt: str = "You are an assistant that can call tools.", functions: List[Dict] = None) -> Dict[str, Any]:
+    """Simulate an LLM that either answers directly or chooses a function to call based on keywords.
+    This is useful for running demos without API access.
+    Returns a dict mimicking an LLM response:
+    - if it chooses a tool: {'type':'function_call', 'name':..., 'arguments':{...}}
+    - if direct answer: {'type':'answer', 'content': '...'}
+    """
+    msg = user_message.lower()
+    # simplistic heuristics
+    if 'price' in msg or 'stock' in msg or 'sku' in msg or 'product' in msg:
+        # call search_db
+        # extract a naive product token
+        tokens = msg.split()
+        # choose a token after 'for' if present
+        if 'for' in tokens:
+            idx = tokens.index('for')
+            product_name = ' '.join(tokens[idx+1:idx+4])
+        else:
+            product_name = 'acme phone'
+        return {'type':'function_call', 'name':'search_db', 'arguments': {'product_name': product_name}}
+    if any(x in msg for x in ['how long', 'shipping', 'return', 'warranty']):
+        return {'type':'function_call', 'name':'faq_retriever', 'arguments': {'query': user_message, 'top_k': 2}}
+    if any(x in msg for x in ['add', 'sum', 'total', '+', '-', '*', '/']):
+        # extract expression: naive
+        expr = ''.join(ch for ch in user_message if ch.isdigit() or ch in '+-*/(). ')
+        if not expr.strip():
+            expr = '0'
+        return {'type':'function_call', 'name':'calculator', 'arguments': {'expression': expr}}
+    # default: direct answer
+    return {'type':'answer', 'content': "I'm sorry — I need to check our product catalog or FAQ. Can you clarify?"}
+
+# 4C) Agent loop
+
+def agent_respond(user_message: str, verbose: bool = False) -> Dict[str, Any]:
+    """Main agent loop: calls the LLM (or simulator), executes functions if requested, and returns final answer.
+    Returns a dict with the conversation, tool calls, and final assistant message.
+    """
+    try:
+        logs = {'user': user_message, 'steps': []}
+        # Call the LLM (simulator here) with function schemas
+        llm_resp = simulate_llm_response(user_message, functions=FUNCTION_SCHEMAS)
+        logs['llm_response'] = llm_resp
+
+        if llm_resp.get('type') == 'function_call':
+            fname = llm_resp['name']
+            args = llm_resp.get('arguments', {})
+            if verbose:
+                print(f"LLM requested function: {fname} with args {args}")
+            # dispatch
+            if fname == 'search_db':
+                tool_output = search_db(args.get('product_name', ''))
+            elif fname == 'calculator':
+                tool_output = calculator(args.get('expression', ''))
+            elif fname == 'faq_retriever':
+                top_k = args.get('top_k', 2)
+                docs = faq_retriever.retrieve(args.get('query', ''), top_k=top_k)
+                tool_output = {'tool': 'faq_retriever', 'query': args.get('query', ''), 'results': docs}
+            else:
+                tool_output = {'error': 'unknown function'}
+
+            logs['steps'].append({'function_called': fname, 'args': args, 'tool_output': tool_output})
+
+            # Now ask the LLM to synthesize a final answer given the tool output.
+            # In a real setup, you would send the tool_output as part of the model messages and request completion.
+            # Here we synthesize a simple reply.
+            if fname == 'search_db':
+                if not tool_output['results']:
+                    assistant_text = "I couldn't find that product in our catalog. Can you provide SKU or exact name?"
+                else:
+                    p = tool_output['results'][0]
+                    assistant_text = (f"Found product: {p['name']} (SKU: {p['sku']}). Price: ${p['price']:.2f}. "
+                                      f"Stock: {p['stock']} units. Description: {p['description']}")
+            elif fname == 'calculator':
+                if 'error' in tool_output:
+                    assistant_text = f"I couldn't calculate that expression: {tool_output['error']}"
+                else:
+                    assistant_text = f"The result is: {tool_output['result']}"
+            elif fname == 'faq_retriever':
+                results = tool_output['results']
+                if not results:
+                    assistant_text = "I couldn't find anything in our FAQs. Could you clarify your question?"
+                else:
+                    # provide concise answers with source references
+                    parts = []
+                    for r in results:
+                        parts.append(f"- {r['text']} (score: {r['score']:.2f})")
+                    assistant_text = "Here are relevant FAQ excerpts:\n" + "\n".join(parts)
+            else:
+                assistant_text = "I ran a tool but couldn't synthesize an answer."
+
+            logs['assistant'] = assistant_text
+            return {'status': 'ok', 'logs': logs}
+
+        else:
+            # direct answer
+            logs['assistant'] = llm_resp.get('content', '')
+            return {'status': 'ok', 'logs': logs}
+
+    except Exception as e:
+        return {'status': 'error', 'error': str(e), 'trace': traceback.format_exc()}
+
+# ---------------------------
+# 5) Demo conversations & tests
+# ---------------------------
+
+demo_questions = [
+    "What's the price and stock for Acme Phone X?",
+    "How long is the warranty on Acme Headphones?",
+    "What's 129.99 + 20?",
+    "Tell me about shipping times",
+    "Do you have SKU APX-100 in stock?",
+]
+
+for q in demo_questions:
+    print("USER:", q)
+    out = agent_respond(q, verbose=True)
+    print("ASSISTANT:", out['logs']['assistant'])
+    print('-'*80)
+
+# ---------------------------
+# 6) Evaluation, Notes & Extensions
+# ---------------------------
+
+# Evaluation suggestions:
+# - Create a set of test queries and expected outputs and run them to calculate accuracy.
+# - For RAG/FAQ answers, check if the tool response contains source ids and compute precision@k.
+
+# Extensions to improve the project and score:
+# 1) Replace the simulator with a real LLM API and pass FUNCTION_SCHEMAS so the model actually performs function calling.
+#    - For OpenAI: use the "functions" parameter in chat completions.
+#    - For Google Gemini: use the equivalent function-calling approach or structured JSON mode.
+# 2) Improve search_db using full-text search (SQLite FTS5) or integrate a real product DB.
+# 3) Use embeddings from OpenAI / Gemini for FAQ retrieval instead of TF-IDF or local models.
+# 4) Add conversation memory (store prior user messages and tool outputs) and use it as context.
+# 5) Add metrics and unit tests.
+
+# Deployment ideas:
+# - Deploy as a web app (Streamlit / Flask) that calls the notebook functions.
+# - Create a demo video showing common flows: product lookup, warranty FAQ, quick math.
+
+# Save a sample CSV of products for Kaggle submission or sharing
+pd.DataFrame(products, columns=['id','name','sku','price','stock','description']).to_csv('sample_products.csv', index=False)
+print('Wrote sample_products.csv')
